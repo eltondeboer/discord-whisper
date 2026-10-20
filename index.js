@@ -5,13 +5,13 @@ import {
 } from 'discord.js';
 import {
   createAudioPlayer, createAudioResource, EndBehaviorType, entersState, joinVoiceChannel,
-  NoSubscriberBehavior, StreamType, VoiceConnectionStatus,
+  getVoiceConnection, NoSubscriberBehavior, StreamType, VoiceConnectionStatus,
 } from '@discordjs/voice';
 import opus from '@discordjs/opus';
 import { mix } from './mix.js';
 
 const env = process.env;
-for (const k of ['GUILD_ID', 'TEAM_A_TOKEN', 'TEAM_A_CHANNEL', 'TEAM_B_TOKEN', 'TEAM_B_CHANNEL', 'SPECTATOR_TOKEN', 'SPECTATOR_CHANNEL']) {
+for (const k of ['TEAM_A_TOKEN', 'TEAM_B_TOKEN', 'SPECTATOR_TOKEN']) {
   if (!env[k]) throw new Error(`Missing env var ${k}`);
 }
 
@@ -21,8 +21,8 @@ const MAX_QUEUE = 5; // drop old audio past 100ms so the relay never drifts behi
 const MAX_OUT = 3;
 
 const teams = {
-  a: { name: env.TEAM_A_NAME || 'Team A', token: env.TEAM_A_TOKEN, channel: env.TEAM_A_CHANNEL, live: false, speakers: new Map() },
-  b: { name: env.TEAM_B_NAME || 'Team B', token: env.TEAM_B_TOKEN, channel: env.TEAM_B_CHANNEL, live: false, speakers: new Map() },
+  a: { name: env.TEAM_A_NAME || 'Team A', token: env.TEAM_A_TOKEN, live: false, speakers: new Map() },
+  b: { name: env.TEAM_B_NAME || 'Team B', token: env.TEAM_B_TOKEN, live: false, speakers: new Map() },
 };
 
 async function login(token) {
@@ -33,8 +33,10 @@ async function login(token) {
   return client;
 }
 
-async function join(client, channelId, group, listen) {
-  const guild = await client.guilds.fetch(env.GUILD_ID);
+async function join(client, guildId, channelId, group, listen) {
+  const guild = client.guilds.cache.get(guildId);
+  if (!guild) throw new Error(`${client.user.username} is not in this server, invite it first`);
+  getVoiceConnection(guildId, group)?.destroy();
   const conn = joinVoiceChannel({
     guildId: guild.id, channelId, group, adapterCreator: guild.voiceAdapterCreator,
     selfDeaf: !listen, selfMute: listen,
@@ -73,7 +75,8 @@ function listen(team, conn) {
         if (queue.length > MAX_QUEUE) queue.shift();
       })
       .on('error', (e) => console.error(`receive error ${userId}`, e))
-      .once('close', () => team.speakers.delete(userId));
+      // A moved bot's old stream closes late; don't delete the new stream's queue.
+      .once('close', () => team.speakers.get(userId) === queue && team.speakers.delete(userId));
   });
 }
 
@@ -119,18 +122,53 @@ function panel() {
   };
 }
 
-const spectator = await login(env.SPECTATOR_TOKEN);
-await spectator.application.commands.create(
+const commands = [
   new SlashCommandBuilder()
     .setName('relay')
     .setDescription('Show the team comms relay controls')
     .setDefaultMemberPermissions(PermissionFlagsBits.MuteMembers),
-  env.GUILD_ID,
-);
+  new SlashCommandBuilder()
+    .setName('join')
+    .setDescription('Move a relay bot into the voice channel you are in')
+    .addStringOption((o) => o.setName('bot').setDescription('Which bot').setRequired(true).addChoices(
+      { name: `${teams.a.name} listener`, value: 'a' },
+      { name: `${teams.b.name} listener`, value: 'b' },
+      { name: 'Spectator speaker', value: 'spectator' },
+    ))
+    .setDefaultMemberPermissions(PermissionFlagsBits.MuteMembers),
+];
+
+const player = createAudioPlayer({
+  behaviors: { noSubscriber: NoSubscriberBehavior.Play, maxMissedFrames: Infinity },
+});
+player.on('error', (e) => console.error('player error', e));
+player.play(createAudioResource(out, { inputType: StreamType.Opus }));
+
+async function onJoin(i) {
+  const channelId = i.member.voice.channelId;
+  if (!channelId) return i.reply({ content: 'Join a voice channel first.', flags: MessageFlags.Ephemeral });
+  await i.deferReply({ flags: MessageFlags.Ephemeral });
+  const key = i.options.getString('bot');
+  if (key === 'spectator') {
+    (await join(spectator, i.guildId, channelId, key, false)).subscribe(player);
+  } else {
+    listen(teams[key], await join(teams[key].client, i.guildId, channelId, key, true));
+  }
+  await i.editReply(`Joined <#${channelId}>.`);
+}
+
+const spectator = await login(env.SPECTATOR_TOKEN);
+for (const team of Object.values(teams)) team.client = await login(team.token);
+
+// Per-server registration shows up instantly, unlike global commands.
+const register = (guild) => guild.commands.set(commands).catch((e) => console.error(`register in ${guild.name} failed`, e));
+spectator.guilds.cache.forEach(register);
+spectator.on(Events.GuildCreate, register);
 
 spectator.on(Events.InteractionCreate, async (i) => {
   try {
     if (i.isChatInputCommand() && i.commandName === 'relay') return await i.reply(panel());
+    if (i.isChatInputCommand() && i.commandName === 'join') return await onJoin(i);
     if (!i.isButton() || !i.customId.startsWith('toggle:')) return;
     // Anyone who can see the panel can click, so re-check the mod permission here.
     if (!i.memberPermissions?.has(PermissionFlagsBits.MuteMembers)) {
@@ -142,19 +180,9 @@ spectator.on(Events.InteractionCreate, async (i) => {
     await i.update(panel());
   } catch (e) {
     console.error('interaction error', e);
+    if (i.deferred) await i.editReply(`Failed: ${e.message}`).catch(() => {});
   }
 });
 
-const player = createAudioPlayer({
-  behaviors: { noSubscriber: NoSubscriberBehavior.Play, maxMissedFrames: Infinity },
-});
-player.on('error', (e) => console.error('player error', e));
-player.play(createAudioResource(out, { inputType: StreamType.Opus }));
-(await join(spectator, env.SPECTATOR_CHANNEL, 'spectator', false)).subscribe(player);
-
-for (const [key, team] of Object.entries(teams)) {
-  listen(team, await join(await login(team.token), team.channel, key, true));
-}
-
 startClock();
-console.log('Relay running. Use /relay in Discord to open the controls.');
+console.log('Relay running. In Discord: /join to place the bots, /relay for the mute controls.');
