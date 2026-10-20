@@ -41,6 +41,8 @@ A mod (anyone with **Mute Members**) does the following:
 1. Join team 1's voice channel and run `/join bot:Team A listener`. Do the same for team 2 and for the spectator channel (`Spectator speaker`). Running `/join` again moves a bot.
 2. Run `/relay` in any text channel. Both teams start **muted**. Click a team's button to switch it between LIVE and muted.
 
+3. When you're done, run `/leave` to disconnect all 3 bots.
+
 After a restart, the bots leave their channels, so run `/join` again.
 
 ## Dev

@@ -48,7 +48,7 @@ async function join(client, guildId, channelId, group, listen) {
         entersState(conn, VoiceConnectionStatus.Connecting, 5_000),
       ]);
     } catch {
-      conn.rejoin();
+      conn.destroy(); // kicked or channel deleted; network drops are retried by the library itself
     }
   });
   conn.on('error', (e) => console.error(`[${group}] voice error`, e));
@@ -136,6 +136,10 @@ const commands = [
       { name: 'Spectator speaker', value: 'spectator' },
     ))
     .setDefaultMemberPermissions(PermissionFlagsBits.MuteMembers),
+  new SlashCommandBuilder()
+    .setName('leave')
+    .setDescription('Disconnect all relay bots from voice')
+    .setDefaultMemberPermissions(PermissionFlagsBits.MuteMembers),
 ];
 
 const player = createAudioPlayer({
@@ -169,6 +173,10 @@ spectator.on(Events.InteractionCreate, async (i) => {
   try {
     if (i.isChatInputCommand() && i.commandName === 'relay') return await i.reply(panel());
     if (i.isChatInputCommand() && i.commandName === 'join') return await onJoin(i);
+    if (i.isChatInputCommand() && i.commandName === 'leave') {
+      for (const group of ['a', 'b', 'spectator']) getVoiceConnection(i.guildId, group)?.destroy();
+      return await i.reply({ content: 'All relay bots left voice.', flags: MessageFlags.Ephemeral });
+    }
     if (!i.isButton() || !i.customId.startsWith('toggle:')) return;
     // Anyone who can see the panel can click, so re-check the mod permission here.
     if (!i.memberPermissions?.has(PermissionFlagsBits.MuteMembers)) {
